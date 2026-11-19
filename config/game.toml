@@ -328,6 +328,14 @@ at = 0x1E5FB7
 call = "RecoilDecay"
 
 [[hook]]
+at = 0x1DBFED
+call = "ShotStart"
+
+[[hook]]
+at = 0x1DC930
+call = "ShotAim"
+
+[[hook]]
 at = 0x1E6392
 call = "SwayBegin"
 

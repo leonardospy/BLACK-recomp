@@ -14,6 +14,7 @@
 #include "core/log.h"
 #include "game/flash.h"
 #include "game/layout.h"
+#include "vr/vr.h"
 #include "xdk/hle.h"
 
 using namespace kernel;
@@ -80,6 +81,16 @@ void MouseLook(X86Context& ctx, uint8_t*) {
         pitch += invert ? -turn.pitch : turn.pitch;
         if (turn.recenter) G<float>(ctx.esi + kControllerPitch) = 0.0f;  // level
     }
+    // VR: the head turns the view as well, and its pitch is the view's
+    float head_yaw;
+    float head_pitch;
+    if (vr::Active()) vr::LookKept(G<float>(ctx.esi + kControllerPitch));
+    if (vr::TakeLook(head_yaw, head_pitch)) {
+        yaw = std::remainder(yaw + head_yaw, 360.0f);
+        G<float>(ctx.esi + kControllerYaw) += yaw;
+        G<float>(ctx.esi + kControllerPitch) = head_pitch;
+        return;
+    }
     if (yaw == 0.0f && pitch == 0.0f) return;
     yaw = std::remainder(yaw, 360.0f);
     G<float>(ctx.esi + kControllerYaw) += yaw;
@@ -92,6 +103,7 @@ bool AimAssist(X86Context&, uint8_t*) { return game::Opt().aim_assist && !input:
 
 // the look update: xmm3 the stick's yaw speed, xmm0 its pitch speed, before the zoom scale and frame time
 void StickLook(X86Context& ctx, uint8_t*) {
+    if (vr::Active()) ctx.xmm[0].f[0] = 0.0f;  // the head pitches the view
     if (input::KeyboardActive()) return;
     const game::Options& o = game::Opt();
     bool zoomed = Zoomed(ctx);
@@ -110,6 +122,11 @@ constexpr uint32_t kHoldAimWeapon = 0x18;  // esp offset of the weapon at the ho
 // ebx the player's controller past the game's toggle aim, scopes and all.
 // A toggle on a weapon that cannot aim would stay on and aim the next weapon.
 void HoldAim(X86Context& ctx, uint8_t*) {
+    // VR: the hand aims, the game's aim down the sights stays off
+    if (vr::Active()) {
+        G<uint8_t>(ctx.ebx + kControllerAimWanted) = 0;
+        return;
+    }
     bool hold = input::KeyboardActive() ? game::Opt().hold_aim : game::Opt().controller_hold_aim;
     if (!hold && CanAim(R32(ctx.esp + kHoldAimWeapon))) return;
     G<uint8_t>(ctx.ebx + kControllerAimWanted) = G<uint8_t>(ctx.ebx + kControllerAimHeld);

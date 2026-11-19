@@ -13,7 +13,8 @@ elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../XboxXBE-Recomp/cmake/XbeRecomp.cmak
     set(SDK ${CMAKE_CURRENT_SOURCE_DIR}/../XboxXBE-Recomp)
 else()
     include(FetchContent)
-    FetchContent_Declare(xbe_sdk GIT_REPOSITORY https://github.com/TGP482/XboxXBE-Recomp.git GIT_TAG main)
+    FetchContent_Declare(xbe_sdk GIT_REPOSITORY https://github.com/TGP482/XboxXBE-Recomp.git
+                         GIT_TAG 91146ff6e2a218b19c1109dc665d06020472ab57)  # newer SDKs change the Backend API
     FetchContent_MakeAvailable(xbe_sdk)
     set(SDK ${xbe_sdk_SOURCE_DIR})
 endif()
@@ -39,6 +40,16 @@ endif()
 
 add_xbe_image(Black default.xbe game.toml ${GAME_PARTITIONS} game)
 
+# VR: the OpenXR loader, linked in statically
+include(FetchContent)
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
+set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(openxr GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git GIT_TAG release-1.1.49
+                     GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(openxr)
+target_link_libraries(Black PRIVATE openxr_loader)
+
 # build_info.h for the version resource, rewritten only when the commit changes
 find_package(Git QUIET)
 set(BUILD_INFO ${CMAKE_CURRENT_BINARY_DIR}/build_info.h)
@@ -54,3 +65,17 @@ set_source_files_properties(src/common/version.rc PROPERTIES
 target_sources(Black PRIVATE src/common/version.rc)
 add_dependencies(Black build_info)
 set_target_properties(Black PROPERTIES OUTPUT_NAME BLACK)
+
+# BLACK_VR.exe: starts BLACK.exe in VR (--vr, vr::Wanted); BLACK.exe alone is the keyboard and mouse game
+add_executable(BlackVR WIN32 tools/vr_launcher.cpp)
+set_target_properties(BlackVR PROPERTIES OUTPUT_NAME BLACK_VR)
+target_compile_definitions(BlackVR PRIVATE UNICODE _UNICODE)
+target_link_options(BlackVR PRIVATE -municode)
+add_dependencies(BlackVR Black)
+
+# VR: the player's models (tools/vr_assets.py makes them) beside the executable
+file(GLOB VR_MODELS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/vr_assets/*.bvr)
+add_custom_command(TARGET Black POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:Black>/vr_assets
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${VR_MODELS} $<TARGET_FILE_DIR:Black>/vr_assets
+    VERBATIM)

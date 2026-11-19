@@ -20,6 +20,7 @@
 #include "common/mouse_keyboard.h"
 #include "common/options.h"
 #include "core/log.h"
+#include "vr/vr.h"
 
 namespace game {
 
@@ -132,6 +133,8 @@ void ApplyDeadZone(input::Pad& pad, float zone) {
 }
 
 void Pad(int port, input::Pad& pad) {
+    // the VR controllers are the first controller
+    if (port == 0) vr::ControllerPad(pad.lx, pad.ly, pad.rx, pad.ry, pad.buttons, pad.analog);
     UpdateTriggerRest(port, pad);
     input::SeenPad(pad);
     if (port == 0) pad.connected = true;
@@ -147,6 +150,7 @@ void Rumble(int port, uint16_t& left, uint16_t& right) {
     if (port == 0 && input::KeyboardActive()) percent = 0;
     left = uint16_t(std::min(left * percent / 100, 0xFFFFu));  // past 100% the motors saturate
     right = uint16_t(std::min(right * percent / 100, 0xFFFFu));
+    if (port == 0) vr::Rumble(left, right);
 }
 
 // the Windows display language when the game has it, else English
@@ -278,7 +282,10 @@ const app::GameInfo app::kGame = {
                 {"gyro_button", nullptr, &game::Opt().gyro.button},
                 {"gyro_button_mode", nullptr, &game::Opt().gyro.button_mode},
                 {"gyro_recenter_button", nullptr, &game::Opt().gyro.recenter_button},
-                {"menu_animations", &game::Opt().menu_animations, nullptr}},
+                {"menu_animations", &game::Opt().menu_animations, nullptr},
+                {"vr_hud_size", nullptr, &game::Opt().vr_hud_size},
+                {"vr_world_scale", nullptr, &game::Opt().vr_world_scale},
+                {"vr_left_handed", &game::Opt().vr_left_handed, nullptr}},
     .load = game::Load,
     .save = game::Save,
     .init = game::Init,

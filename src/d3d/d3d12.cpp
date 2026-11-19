@@ -45,12 +45,17 @@
 #include "gpu/texturedumper.h"
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
+#include "vr/vr.h"
 
 using Microsoft::WRL::ComPtr;
 
 namespace gpu {
 
 namespace {
+
+// VR: root parameter 4, VrHlsl's 9 rows of constants at b2
+constexpr UINT kVrRootParam = 4;
+constexpr UINT kVrRootFloats = 36;
 
 constexpr int kFrames = 3;
 constexpr uint64_t kUploadSize = 64ull << 20;
@@ -968,6 +973,44 @@ private:
     float RenderTargetShift(const State& s, const DrawShaders& sh) const;
     void UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
                          GuestExtent size, DrawConstants& c);
+    // VR: which of the game's rows the draw's position goes through
+    void VrRows(const State& s, const DrawShaders& sh, const DrawTextures& stages);
+    // VR at the present: the session follows the option, the frame goes to the headset
+    void UpdateVr();
+    bool RecordVr(Target* t, int view);  // the shown frame into the headset's image for view
+    ComPtr<ID3D12DescriptorHeap> vr_rtv_;
+    // the laser's probe: a pixel of how far it goes before the scene's depth, read back a few frames later
+    void VrLaserProbe(const vr::Frame& f);
+    // the frame's models into what is bound, w x h: brightness over the models' own light
+    void DrawModelList(const vr::Frame& f, DXGI_FORMAT fmt, uint32_t samples, bool depth, uint32_t w, uint32_t h,
+                       float bright);
+    // the test room: an eye drawn with the models alone, into its own depth
+    bool RecordRoom(D3D12_CPU_DESCRIPTOR_HANDLE rtv, DXGI_FORMAT fmt, uint32_t w, uint32_t h);
+    ComPtr<ID3D12Resource> room_ds_;
+    ComPtr<ID3D12DescriptorHeap> room_dsv_;
+    uint32_t room_w_ = 0, room_h_ = 0;
+    ComPtr<ID3D12Resource> laser_rt_;
+    ComPtr<ID3D12DescriptorHeap> laser_rtv_;
+    ComPtr<ID3D12Resource> laser_rb_[4];
+    uint32_t laser_n_ = 0;
+    ID3D12Resource* shown_ = nullptr;  // the frame DrawFrame showed, valid until the next draw
+    const vr::Frame& VrFrame();
+    // the player's own models (vr/models.h) into the bound scene
+    void VrDrawModels(const State& s);
+    bool EnsureVrModels();
+    ID3D12PipelineState* EnsureVrModelPipeline(DXGI_FORMAT rtv, uint32_t samples, bool depth);
+    ComPtr<ID3D12RootSignature> vr_model_root_;
+    ComPtr<ID3D12Resource> vr_model_vb_;
+    ComPtr<ID3D12Resource> vr_model_ib_;
+    std::vector<std::pair<uint32_t, uint32_t>> vr_model_base_;  // per model: first vertex, first index
+    std::vector<Tex> vr_model_tex_;  // per model: its texture, white without one
+    std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> vr_model_pso_;
+    bool vr_models_tried_ = false;
+    vr::Frame vr_frame_{};
+    uint64_t vr_marked_ = 0;    // presents_ + 1 of the frame whose world the player's models went into
+    uint64_t vr_frame_id_ = 0;  // presents_ + 1 of vr_frame_, 0 none
+    bool vr_failed_ = false;  // the last start failed: tried again every few seconds
+    std::chrono::steady_clock::time_point vr_retry_{};
     void FillTextureConstants(const State& s, const DrawShaders& sh, const DrawTextures& stages, DrawConstants& c);
     void FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c);
     void CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
@@ -976,6 +1019,17 @@ private:
     void EndDrawCapture(const State& s, const Assembled& a, uint32_t count, const DrawConstants& c);
     void CaptureInputs(const State& s, const Assembled& a, const DrawConstants& c);
     void CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk);
+    void GunDump(const State& s, const Assembled& a, const DrawShaders& sh, const DrawTextures& stages, uint32_t prim);
+    uint32_t gun_dump_i_ = 0;
+    uint64_t anim_frame_ = 0;  // presents_ + 1 of the frame whose palette BLACK_VR_DUMPANIM wrote
+    struct GunTex {
+        ComPtr<ID3D12Resource> res;
+        DXGI_FORMAT fmt;
+        uint32_t w, h;
+        std::filesystem::path dir;
+        std::string name;
+    };
+    std::vector<GunTex> gun_tex_;  // saved at the present, outside the frame's commands
     void CaptureShader(const char* kind, uint64_t key, const std::string& src);
     void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
     uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
@@ -1303,7 +1357,7 @@ bool D3D12Backend::CreateRootSignature() {
     ranges[0].NumDescriptors = 4;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
     ranges[1].NumDescriptors = 4;
-    D3D12_ROOT_PARAMETER params[4] = {};
+    D3D12_ROOT_PARAMETER params[5] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -1314,8 +1368,13 @@ bool D3D12Backend::CreateRootSignature() {
         params[2 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
         params[2 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
+    // VR: VrHlsl's vrm, b2
+    params[kVrRootParam].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[kVrRootParam].Constants.ShaderRegister = 2;
+    params[kVrRootParam].Constants.Num32BitValues = kVrRootFloats;
+    params[kVrRootParam].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_ROOT_SIGNATURE_DESC rsd{};
-    rsd.NumParameters = 4;
+    rsd.NumParameters = 5;
     rsd.pParameters = params;
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> rs;
@@ -2554,18 +2613,57 @@ void EnsureProgramHash(const State& s) {
 // vertex shader cache key salts
 constexpr uint64_t kDeclarationSalt = 0x10000;    // fixed function seed, above the 16 bit register mask
 constexpr uint64_t kPretransformedSalt = 0x5A5A;  // screen space fixed function vertices, apart from untransformed
+constexpr uint64_t kVrSalt = 0x9E3779B97F4A7C18ull;  // VR: the position goes through VrHlsl
 
 uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
     uint64_t seed = sh.prog ? s.vs->hash ^ a.regs : Hash(&s.vs_handle, 4, a.regs | kDeclarationSalt);
     uint64_t vkey = Hash(&a.decode, 8, seed);
     if (!sh.prog && a.pretransformed) vkey ^= kPretransformedSalt;
     if (!sh.prog) vkey = Hash(&sh.fk, sizeof(sh.fk), vkey);
+    if (vr::Active()) vkey ^= kVrSalt;
     return vkey;
 }
 
+// VR: the clip position, once the game's transform is done, through the 4 rows VrRows picks for the draw
+std::string VrHlsl(std::string src) {
+    // b2, root constants of their own (the title's programs read every one of the console's constants):
+    // vrm[0] to vrm[3] for a position in perspective, vrm[4] to vrm[7] for a flat one (w 1: screen space), vrm[8]
+    // x and y the play camera's depth (view z = x / (ndc z - y)), z 1 when flat positions with depth are the world's,
+    // 2 for the backdrop (the sky, drawn flat before the world: far away in it); w 1 hides the HUD's aim mark
+    static const char* kRows = "cbuffer VR : register(b2) { float4 vrm[9]; };\n";
+    static const char* kMove =
+        "    {\n"
+        "        precise float4 vp = o.pos;\n"
+        "        if (abs(vp.w - 1) < 1e-6 && vrm[8].z > 1.5 && vrm[8].x != 0 && vrm[8].y < 1) {\n"
+        "            precise float vz = 0.9 * vrm[8].x / (1 - vrm[8].y);\n"
+        "            vp = float4(vp.xy * vz, vrm[8].y * vz + vrm[8].x, vz);\n"
+        "        }\n"
+        "        if (abs(vp.w - 1) < 1e-6 && vrm[8].w > 0.5 && abs(vp.x) < 0.05 && abs(vp.y) < 0.065)\n"
+        "            vp = float4(2, 2, 0.5, 1);\n"
+        "        else if (abs(vp.w - 1) < 1e-6 && vrm[8].z > 0.5 && vrm[8].z < 1.5 && vrm[8].x != 0 && vp.z > 0 && min(vp.z, 0.99999) != vrm[8].y) {\n"
+        "            precise float zz = min(vp.z, 0.99999);\n"  // the sky at the far plane: just inside it
+        "            precise float vz = vrm[8].x / (zz - vrm[8].y);\n"
+        "            vp = float4(vp.xy * vz, zz * vz, vz);\n"
+        "        }\n"
+        "        if (abs(vp.w - 1) < 1e-6)\n"
+        "            vp = float4(dot(vrm[4], vp), dot(vrm[5], vp), dot(vrm[6], vp), dot(vrm[7], vp));\n"
+        "        else\n"
+        "            vp = float4(dot(vrm[0], vp), dot(vrm[1], vp), dot(vrm[2], vp), dot(vrm[3], vp));\n"
+        "        o.pos = vp;\n"
+        "    }\n";
+    size_t entry = src.find("VOut main(");
+    if (entry != std::string::npos) src.insert(entry, kRows);
+    for (const char* at : {"    o.pos = q;\n", "    o.pos = cp;\n"}) {
+        size_t p = src.find(at);
+        if (p != std::string::npos) src.insert(p + std::strlen(at), kMove);
+    }
+    return src;
+}
+
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
-    if (sh.prog) return VertexProgram(*s.vs, a.regs, a.decode);
-    return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
+    std::string src = sh.prog ? VertexProgram(*s.vs, a.regs, a.decode)
+                              : FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
+    return vr::Active() ? VrHlsl(std::move(src)) : src;
 }
 
 // sets sh.vh and sh.vs_code, compiling the shader on a cache miss
@@ -2598,6 +2696,7 @@ constexpr uint64_t kNearDepthSalt = 0xC2B2AE3D27D4EB4Full;
 
 // c-38, the viewport scale; its w the plane d3d8.cpp NearDepth set, 0 without
 constexpr uint32_t kViewportScaleRow = 58;
+constexpr uint32_t kViewportOffsetRow = 59;  // its w: d3d::VrGun's flag
 
 bool NearDepth(const State& s) { return s.vsc[kViewportScaleRow][3] > 0; }
 
@@ -2928,6 +3027,7 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
                                    GuestExtent size, DrawConstants& c) {
     Alloc vc = Upload(sizeof(s.vsc), 256);
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
+    if (vr::Active()) VrRows(s, sh, stages);
     Alloc dc = Upload(sizeof(DrawConstants), 256);
     FillSurfaceConstants(s, size, c);
     FillFogConstants(s, c);
@@ -3162,6 +3262,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     DrawConstants c{};
     UploadConstants(s, sh, k, stages, size, c);
 
+    if (s.vsc[59][3] > 0.5f) GunDump(s, a, sh, stages, prim);
     if (cap_) {
         CaptureDraw(s, prim, count, k, c, stages);
         EndDrawCapture(s, a, count, c);
@@ -3222,6 +3323,11 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
         float p[4 * kOcclusionRects];
         std::memcpy(p, rects, sizeof(p));
         Occlusion(s, p);
+        return;
+    }
+    if (flags & kClearVrModels) {
+        vr_marked_ = presents_ + 1;
+        VrDrawModels(s);
         return;
     }
     PerfScope perf_clear{g_perf.clear};
@@ -3479,6 +3585,7 @@ bool D3D12Backend::ResizeBackBuffers(uint32_t w, uint32_t h, DXGI_FORMAT fmt, DX
 void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
     D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
     ID3D12Resource* r = PrepareShownFrame(t);
+    shown_ = r;
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
     // without its targets an HDR10 back buffer stays black: the SDR pipelines don't match its format
@@ -3745,6 +3852,83 @@ void D3D12Backend::FinishCapture(const Surface& front) {
     LOGI("d3d12: frame captured to %s", cap_dir_.string().c_str());
 }
 
+// debug, BLACK_VR_DUMPGUN: the first person gun and arms' draws of a frame every 10 s, to gundump\<frame>:
+// each draw's inputs as the input assembler takes them, its constants, its program and its textures
+void D3D12Backend::GunDump(const State& s, const Assembled& a, const DrawShaders& sh, const DrawTextures& stages,
+                           uint32_t prim) {
+    // BLACK_VR_DUMPANIM: the bone palette the first person gun and arms are drawn with, every frame, to
+    // gundump\anim.bin: per frame u32 frame, u32 shots so far, i32 rounds in the gun, then the 192 constants
+    static const bool anim = std::getenv("BLACK_VR_DUMPANIM") != nullptr;
+    if (anim && anim_frame_ != presents_ + 1) {
+        anim_frame_ = presents_ + 1;
+        static FILE* f = [] {
+            std::error_code ec;
+            std::filesystem::create_directories(app::ExeDir() / "gundump", ec);
+            return _wfopen((app::ExeDir() / "gundump" / "anim.bin").c_str(), L"wb");
+        }();
+        if (f) {
+            uint32_t head[3] = {uint32_t(presents_), vr::Shots(), uint32_t(vr::Rounds())};
+            fwrite(head, 4, 3, f);
+            fwrite(s.vsc.data(), 1, sizeof(s.vsc), f);
+            fflush(f);
+        }
+    }
+    static const bool on = std::getenv("BLACK_VR_DUMPGUN") != nullptr;
+    if (!on || presents_ % 600 != 300) return;
+    std::error_code ec;
+    auto dir = app::ExeDir() / "gundump" / std::to_string(presents_);
+    std::filesystem::create_directories(dir, ec);
+    char base[32];
+    snprintf(base, sizeof(base), "d%03u_", gun_dump_i_++ % 1000);
+    auto path = [&](const char* name) { return dir / (std::string(base) + name); };
+    auto write = [&](const char* name, const void* p, size_t n) {
+        if (FILE* f = _wfopen(path(name).c_str(), L"wb")) {
+            fwrite(p, 1, n, f);
+            fclose(f);
+        }
+    };
+    FILE* t = _wfopen(path("info.txt").c_str(), L"w");
+    if (!t) return;
+    fprintf(t, "prim %u regs %X count %u decode %016llX topology %d strip %d pretransformed %d buffers %u index16 %d "
+               "index_count %u draw_count %u base_vertex %d converted %zu indices %zu prog %d vs %08X\n",
+            prim, a.regs, a.vertex_count, (unsigned long long)a.decode, int(a.topology), int(a.strip),
+            int(a.pretransformed), a.buffer_count, int(a.index16), a.index_count, a.draw_count, a.base_vertex,
+            a.vertices.size(), a.indices.size(), int(sh.prog), s.vs_handle);
+    for (int r = 0; r < 16; r++) {
+        if (!((a.regs >> r) & 1)) continue;
+        const auto& e = a.elements[size_t(r)];
+        fprintf(t, "reg %d format %u buffer %u offset %u decode %u\n", r, e.format, e.buffer, e.offset,
+                unsigned((a.decode >> (r * 4)) & 15));
+    }
+    for (uint32_t b = 0; b < a.buffer_count; b++) {
+        const auto& vb = a.buffers[b];
+        fprintf(t, "buffer %u bytes %u stride %u gathered %zu\n", b, vb.bytes, vb.stride, a.gathered[b].size());
+        char n[16];
+        snprintf(n, sizeof(n), "vb%u.bin", b);
+        if (!a.gathered[b].empty()) write(n, a.gathered[b].data(), a.gathered[b].size());
+        else if (vb.src) write(n, vb.src, vb.bytes);
+    }
+    if (!a.vertices.empty()) write("vertices.bin", a.vertices.data(), a.vertices.size() * 4);
+    if (!a.indices.empty()) write("indices32.bin", a.indices.data(), a.indices.size() * 4);
+    else if (a.index_src && a.index_count) write(a.index16 ? "indices16.bin" : "indices32.bin", a.index_src, size_t(a.index_count) * (a.index16 ? 2 : 4));
+    write("vsc.bin", s.vsc.data(), sizeof(s.vsc));
+    std::string src = sh.prog ? VertexProgram(*s.vs, a.regs, a.decode) : std::string("fixed function");
+    write("vs.hlsl", src.data(), src.size());
+    for (int i = 0; i < 4; i++) {
+        TextureDesc d;
+        if (!stages.res[i] || !s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
+        bool tg = targets_.count(TargetMapKey(d.data, Format(d.format).depth)) != 0;
+        fprintf(t, "tex %d %08X fmt %X %ux%u%s\n", i, d.data, d.format, d.width, d.height, tg ? " target" : "");
+        if (tg || stages.info[i].kind != kTex2D) continue;
+        char n[32];
+        snprintf(n, sizeof(n), "tex_%08X", d.data);
+        bool have = false;
+        for (const auto& g : gun_tex_) have |= g.dir == dir && g.name == n;
+        if (!have) gun_tex_.push_back({stages.res[i], stages.sv[i].Format, d.width, d.height, dir, n});
+    }
+    fclose(t);
+}
+
 void D3D12Backend::StartCapture() {
     SYSTEMTIME tm;
     GetLocalTime(&tm);
@@ -3864,6 +4048,16 @@ void LogPerf() {
 
 void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
+    if (!gun_tex_.empty()) {
+        auto keep = cap_dir_;
+        for (auto& g : gun_tex_) {
+            cap_dir_ = g.dir;
+            D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            CapSave({.res = g.res.Get(), .state = &st, .fmt = g.fmt, .w = g.w, .h = g.h}, g.name.c_str());
+        }
+        cap_dir_ = keep;
+        gun_tex_.clear();
+    }
     if (cap_) {
         FinishCapture(front);
     } else if (g_capture.exchange(false) && CaptureOn()) {
@@ -3877,11 +4071,49 @@ void D3D12Backend::Present(const Surface& front) {
     if (ramp_dirty_) UploadGammaRamp();
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
+    UpdateVr();
+    // the debug head in the test room: the room over the game's frame, as the headset would show it
+    static const bool debug_head = std::getenv("BLACK_VR_DEBUG") != nullptr;
+    if (debug_head && vr::RoomActive() && t && Ms(*t) == 1) {
+        Transition(t->res.Get(), t->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        RecordRoom(Cpu(rtv_heap_.Get(), t->view, rtv_inc_), t->fmt, t->w, t->h);
+        t->drawn = true;
+        cl_->SetGraphicsRootSignature(root_.Get());
+    }
+    // BLACK_VR_SHOTS (with the debug head): the frame every 3 s as vrshots\NNNN.bmp beside the executable
+    static const int shot_every = [] {
+        const char* v = std::getenv("BLACK_VR_SHOTS");
+        int n = v ? std::atoi(v) : 0;
+        return n > 1 ? n : n == 1 ? 180 : 0;
+    }();
+    if (t && shot_every && presents_ % uint64_t(shot_every) == 0) {
+        std::filesystem::path keep = cap_dir_;
+        cap_dir_ = app::ExeDir() / "vrshots";
+        std::error_code ec;
+        std::filesystem::create_directories(cap_dir_, ec);
+        char name[16];
+        std::snprintf(name, sizeof(name), "%05u", unsigned(presents_ / uint64_t(shot_every)));
+        // at the size drawn, not the console's
+        D3D12_RESOURCE_STATES* st;
+        if (ID3D12Resource* r = Flat(*t, st)) CapSave({.res = r, .state = st, .fmt = t->fmt, .w = t->w, .h = t->h}, name);
+        cap_dir_ = keep;
+    }
+    // waits for the headset's frame, which paces the game in VR
+    bool vr_frame = vr::Active() && vr::BeginFrame();
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi);
+    int vr_view = -1;
+    if (vr_frame) {
+        vr::FrameDrawn(VrFrame().rows);
+        vr_view = vr::DrawnView();
+        if (!RecordVr(t, vr_view)) vr_view = -1;
+    }
     Submit(false);
+    // released once the queue has the copy, then the frame ends
+    if (vr_view >= 0) vr::Release(vr_view);
+    if (vr_frame) vr::EndFrame();
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
-    bool vsync = app::Get().vsync;
+    bool vsync = app::Get().vsync && !vr::Active();
     auto perf_swap = PerfClock::now();
     swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
     g_perf.swap += PerfMs(perf_swap);
@@ -3896,9 +4128,517 @@ void D3D12Backend::Present(const Surface& front) {
     ApplySettings();
 }
 
+// the headset session follows the option
+void D3D12Backend::UpdateVr() {
+    bool want = vr::Wanted();
+    if (!want) {
+        vr_failed_ = false;
+        if (vr::Active()) {
+            Flush();
+            vr::Stop();
+        }
+        return;
+    }
+    if (vr::Active()) return;
+    // a headset connected later is picked up: tried again every few seconds
+    auto now = std::chrono::steady_clock::now();
+    if (vr_failed_ && now - vr_retry_ < std::chrono::seconds(3)) return;
+    vr_retry_ = now;
+    if (!vr::Start(dev_.Get(), queue_.Get())) {
+        if (!vr_failed_) LOGE("vr: no OpenXR headset yet (connect it through Link with the Meta Horizon app running)");
+        vr_failed_ = true;
+        return;
+    }
+    vr_failed_ = false;
+    if (!vr_rtv_) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+        dev_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&vr_rtv_));
+    }
+}
+
+// which rows the draw's position goes through: the eye's for the scene in perspective, none for full screen passes
+// that read a target the scene was drawn to, the HUD's for the rest
+void D3D12Backend::VrRows(const State& s, const DrawShaders& sh, const DrawTextures& stages) {
+    const vr::Frame& f = VrFrame();
+    // VrHlsl's vrm: rows 0 to 3 a position in perspective goes through, 4 to 7 a flat one (w 1), then the depth
+    float vrm[kVrRootFloats] = {};
+    auto put = [&](const float (*deep)[4], const float (*flat)[4], int world, bool no_mark = false) {
+        std::memcpy(vrm, deep, 16 * sizeof(float));
+        std::memcpy(vrm + 16, flat, 16 * sizeof(float));
+        vrm[32] = f.depth[0];
+        vrm[33] = f.depth[1];
+        vrm[34] = float(world);
+        vrm[35] = no_mark ? 1.0f : 0.0f;
+        cl_->SetGraphicsRoot32BitConstants(kVrRootParam, kVrRootFloats, vrm, 0);
+    };
+    static const float kIdentity[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+    // shadow maps, reflections and other targets of their own size keep the game's views
+    uint32_t w = 0, h = 0;
+    SurfaceSize(bound_rt_ ? s.rt : s.zs, w, h);
+    if (w != guest_w_ || h != guest_h_) {
+        put(kIdentity, kIdentity, false);
+        return;
+    }
+    // full screen passes over what the scene drew (bloom, blur, fades) stay where they are
+    bool pass = false;
+    for (int i = 0; i < 4 && !pass; i++) {
+        TextureDesc d;
+        if (stages.res[i] && s.textures[size_t(i)] && Describe(s.textures[size_t(i)], d)) {
+            pass = targets_.count(TargetMapKey(d.data, Format(d.format).depth)) != 0;
+        }
+    }
+    if (pass) {
+        put(kIdentity, kIdentity, false);
+        return;
+    }
+    // fixed function with an orthographic projection is flat whatever its w; the rest by its w in VrHlsl, screen
+    // space positions tested against the depth (fire, sparks, smoke) the world's
+    const auto& proj = s.transforms[kTsProjection];
+    bool ortho = sh.fixed_transform && !(proj[11] == 1.0f && proj[15] == 0.0f);
+    // the world's screen space draws test the depth for real; the HUD's pass it always, or test none
+    constexpr uint32_t kZAlways = 0x207;
+    bool tested = s.rs[kRsZEnable] != 0 && SimpleState(s, kMZFunc) != kZAlways;
+    // d3d::VrGun's flag in the viewport offset's w: the gun and arms, into the hand
+    bool gun = s.vsc[kViewportOffsetRow][3] > 0.5f;
+    // in play, flat and untested before the world's models: the backdrop; after, the HUD, its aim mark hidden when
+    // the gun shows its laser
+    bool play = f.rows[0][1] != 0;
+    bool backdrop = play && !ortho && !tested && vr_marked_ != presents_ + 1;
+    int world = !ortho && tested ? 1 : backdrop ? 2 : 0;
+    put(ortho ? f.flat : gun ? f.gun : f.stereo, f.flat, world, world == 0 && play && f.rows[0][2] != 0);
+    if (std::getenv("BLACK_VR_DEBUG") && !ortho) {
+        static std::unordered_map<uint64_t, uint32_t> seen;
+        uint64_t key = uint64_t(sh.prog) << 40 | uint64_t(s.rs[kRsZEnable] != 0) << 36 |
+                       uint64_t(SimpleState(s, kMZWriteEnable) != 0) << 32 | SimpleState(s, kMZFunc);
+        if (seen[key]++ == 0)
+            LOGR("vr: draw kind: program %d zenable %d zwrite %d zfunc %X", int(sh.prog), int(s.rs[kRsZEnable] != 0),
+                 int(SimpleState(s, kMZWriteEnable) != 0), SimpleState(s, kMZFunc));
+    }
+}
+
+// the game's data for the frame being drawn, the frames before it presented
+const vr::Frame& D3D12Backend::VrFrame() {
+    if (vr_frame_id_ != presents_ + 1) {
+        vr_frame_ = vr::FrameFor(presents_);
+        vr_frame_id_ = presents_ + 1;
+    }
+    return vr_frame_;
+}
+
+// the player's own models: skinned to the bone palette or placed whole, lit from above, colours from their
+// materials times their texture (linear, written gamma encoded like the scene's); a texture's alpha is its gloss
+const char* kVrModelHlsl = R"(
+cbuffer C : register(b0) { row_major float4x4 vp; row_major float4x4 world; float4 info; float4 eye; float4 bones[192]; };
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+struct VI { float3 p : POSITION; float3 n : NORMAL; float3 c : COLOR; uint4 j : BLENDINDICES; float4 w : BLENDWEIGHT; float2 uv : TEXCOORD; };
+struct VO { float4 pos : SV_Position; float3 n : NORMAL; float3 c : COLOR; float2 uv : TEXCOORD; float3 wp : POSITION; };
+float3x4 Bone(uint i) { return float3x4(bones[i * 3], bones[i * 3 + 1], bones[i * 3 + 2]); }
+VO vs(VI v) {
+    float3 p = v.p;
+    float3 n = v.n;
+    if (info.x > 0.5) {
+        float3x4 m = Bone(v.j.x) * v.w.x + Bone(v.j.y) * v.w.y + Bone(v.j.z) * v.w.z + Bone(v.j.w) * v.w.w;
+        p = mul(m, float4(v.p, 1));
+        n = mul((float3x3)m, v.n);
+    }
+    VO o;
+    float4 wp = mul(world, float4(p, 1));
+    o.pos = mul(vp, wp);
+    o.n = mul((float3x3)world, n);
+    o.c = v.c;
+    o.uv = v.uv;
+    o.wp = wp.xyz;
+    return o;
+}
+float4 ps(VO i) : SV_Target {
+    float3 n = normalize(i.n);
+    float3 l = normalize(float3(0.3, 1, 0.2));
+    float light = 0.30 + 0.55 * saturate(dot(n, l));
+    float4 t = tex.Sample(smp, i.uv);
+    float3 albedo = i.c * pow(t.rgb, 2.2);
+    float3 c = albedo * light * info.y;
+    if (info.w > 0.5) {
+        // the game's gloss: a soft highlight from above and a sheen at grazing angles
+        float3 v = normalize(eye.xyz - i.wp);
+        float spec = pow(saturate(dot(n, normalize(l + v))), 24) * 0.6 + pow(1 - saturate(dot(n, v)), 4) * 0.15;
+        c += t.a * spec * info.y;
+    }
+    c = pow(saturate(c), 1 / 2.2);
+    if (info.z > 0) c = saturate(i.c * info.z);
+    return float4(c, 1);
+}
+)";
+
+bool D3D12Backend::EnsureVrModels() {
+    if (vr_model_vb_) return true;
+    if (vr_models_tried_) return false;
+    vr_models_tried_ = true;
+    const auto& models = vr::Models();
+    if (models.empty()) return false;
+    size_t verts = 0, idx = 0;
+    for (const auto& m : models) {
+        vr_model_base_.push_back({uint32_t(verts), uint32_t(idx)});
+        verts += m.vertices.size();
+        idx += m.indices.size();
+    }
+    D3D12_HEAP_PROPERTIES up{D3D12_HEAP_TYPE_UPLOAD};
+    auto make = [&](size_t bytes, ComPtr<ID3D12Resource>& out) {
+        D3D12_RESOURCE_DESC d = BufferDesc(bytes);
+        return SUCCEEDED(dev_->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                      nullptr, IID_PPV_ARGS(&out)));
+    };
+    if (!make(verts * sizeof(vr::ModelVertex), vr_model_vb_) || !make(idx * 4, vr_model_ib_)) return false;
+    uint8_t* vp = nullptr;
+    uint8_t* ip = nullptr;
+    D3D12_RANGE none{0, 0};
+    vr_model_vb_->Map(0, &none, reinterpret_cast<void**>(&vp));
+    vr_model_ib_->Map(0, &none, reinterpret_cast<void**>(&ip));
+    for (const auto& m : models) {
+        std::memcpy(vp, m.vertices.data(), m.vertices.size() * sizeof(vr::ModelVertex));
+        vp += m.vertices.size() * sizeof(vr::ModelVertex);
+        std::memcpy(ip, m.indices.data(), m.indices.size() * 4);
+        ip += m.indices.size() * 4;
+    }
+    vr_model_vb_->Unmap(0, nullptr);
+    vr_model_ib_->Unmap(0, nullptr);
+    // the textures, with their mips: white for a model without one
+    static const std::vector<uint8_t> kWhite = {255, 255, 255, 0};
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    for (const auto& m : models) {
+        Tex& t = vr_model_tex_.emplace_back();
+        uint32_t w = m.texture.empty() ? 1 : m.texture_w, h = m.texture.empty() ? 1 : m.texture_h;
+        std::vector<uint8_t> level = m.texture.empty() ? kWhite : m.texture;
+        t.fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+        t.levels = 1;
+        while ((std::max(w, h) >> t.levels) > 0) t.levels++;
+        D3D12_RESOURCE_DESC td = Texture2DDesc(t.fmt, w, h);
+        td.MipLevels = UINT16(t.levels);
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&t.res)))) {
+            return false;
+        }
+        for (uint32_t l = 0; l < t.levels; l++) {
+            UploadTextureLevel(t, 0, l, level, w * 4);
+            // the next level: each 2x2 averaged
+            uint32_t nw = std::max(w / 2, 1u), nh = std::max(h / 2, 1u);
+            std::vector<uint8_t> next(size_t(nw) * nh * 4);
+            for (uint32_t y = 0; y < nh; y++)
+                for (uint32_t x = 0; x < nw; x++)
+                    for (int c = 0; c < 4; c++) {
+                        uint32_t x1 = std::min(x * 2 + 1, w - 1), y1 = std::min(y * 2 + 1, h - 1);
+                        uint32_t sum = level[(size_t(y * 2) * w + x * 2) * 4 + c] + level[(size_t(y * 2) * w + x1) * 4 + c] +
+                                       level[(size_t(y1) * w + x * 2) * 4 + c] + level[(size_t(y1) * w + x1) * 4 + c];
+                        next[(size_t(y) * nw + x) * 4 + c] = uint8_t((sum + 2) / 4);
+                    }
+            level.swap(next);
+            w = nw;
+            h = nh;
+        }
+        D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_COPY_DEST;
+        Transition(t.res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable = {1, &range};
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC smp{};
+    smp.Filter = D3D12_FILTER_ANISOTROPIC;
+    smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    smp.MaxAnisotropy = 8;
+    smp.MaxLOD = D3D12_FLOAT32_MAX;
+    smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rsd{2, params, 1, &smp, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    ComPtr<ID3DBlob> rs, err;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs, &err))) return false;
+    dev_->CreateRootSignature(0, rs->GetBufferPointer(), rs->GetBufferSize(), IID_PPV_ARGS(&vr_model_root_));
+    LOGR("vr: %zu models on the GPU, %zu vertices", models.size(), verts);
+    return vr_model_root_ != nullptr;
+}
+
+ID3D12PipelineState* D3D12Backend::EnsureVrModelPipeline(DXGI_FORMAT rtv, uint32_t samples, bool depth) {
+    uint64_t key = uint64_t(rtv) << 32 | uint64_t(samples) << 1 | (depth ? 1 : 0);
+    auto it = vr_model_pso_.find(key);
+    if (it != vr_model_pso_.end()) return it->second.Get();
+    uint64_t h;
+    ID3DBlob* vs = Compile(kVrModelHlsl, "vs", "vs_5_0", h);
+    ID3DBlob* ps = Compile(kVrModelHlsl, "ps", "ps_5_0", h);
+    if (!vs || !ps) return nullptr;
+    D3D12_INPUT_ELEMENT_DESC el[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 36, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"BLENDWEIGHT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 60, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+    d.pRootSignature = vr_model_root_.Get();
+    d.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    d.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    d.SampleMask = UINT_MAX;
+    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    d.RasterizerState.DepthClipEnable = TRUE;
+    d.DepthStencilState.DepthEnable = depth;
+    d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    d.InputLayout = {el, UINT(std::size(el))};
+    d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    d.NumRenderTargets = 1;
+    d.RTVFormats[0] = rtv;
+    d.DSVFormat = depth ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_UNKNOWN;
+    d.SampleDesc.Count = samples;
+    ComPtr<ID3D12PipelineState> pso;
+    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
+        LOG_FIRST(4, "vr: no pipeline for the models (format %d, %u samples)", int(rtv), samples);
+        return nullptr;
+    }
+    return (vr_model_pso_[key] = pso).Get();
+}
+
+// the laser along its ray against the scene's depth, before the player's models are in it: the first step behind
+// the scene is where it stops. Read back 3 frames later
+const char* kLaserProbeHlsl = R"(
+cbuffer L : register(b1) { row_major float4x4 vp; float4 from; float4 dir; float4 size; };
+#ifdef MS
+Texture2DMS<float> depth : register(t0);
+float Scene(int2 p) { return depth.Load(p, 0); }
+#else
+Texture2D<float> depth : register(t0);
+float Scene(int2 p) { return depth.Load(int3(p, 0)); }
+#endif
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 t = float2((id << 1) & 2, id & 2);
+    return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float ps() : SV_Target {
+    for (int i = 0; i < 320; i++) {
+        float d = 0.05 * pow(1600.0, i / 319.0);
+        float4 c = mul(vp, float4(from.xyz + dir.xyz * d, 1));
+        if (c.w <= 0) continue;
+        float3 n = c.xyz / c.w;
+        if (abs(n.x) > 1 || abs(n.y) > 1) return 0;  // out of the eye's view: not known
+        int2 p = int2((n.xy * float2(0.5, -0.5) + 0.5) * size.xy);
+        if (n.z > Scene(p) + 1e-6) return d;
+    }
+    return 80;
+}
+)";
+
+void D3D12Backend::VrLaserProbe(const vr::Frame& f) {
+    if (f.laser[3] < 0.5f || !bound_ds_) return;
+    Target& ds = *bound_ds_;
+    bool ms = Ms(ds) > 1;
+    if (!laser_rt_) {
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_R32_FLOAT, 1, 1);
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                 nullptr, IID_PPV_ARGS(&laser_rt_))))
+            return;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+        dev_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&laser_rtv_));
+        dev_->CreateRenderTargetView(laser_rt_.Get(), nullptr, laser_rtv_->GetCPUDescriptorHandleForHeapStart());
+        D3D12_HEAP_PROPERTIES rp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC bd = BufferDesc(256);
+        for (auto& rb : laser_rb_)
+            dev_->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                          IID_PPV_ARGS(&rb));
+    }
+    // what an earlier probe found (its copy long done)
+    if (laser_n_ >= 3) {
+        float* v = nullptr;
+        D3D12_RANGE r{0, 4};
+        if (SUCCEEDED(laser_rb_[(laser_n_ - 3) % 4]->Map(0, &r, reinterpret_cast<void**>(&v))) && v) {
+            vr::LaserHit(*v);
+            D3D12_RANGE none{0, 0};
+            laser_rb_[(laser_n_ - 3) % 4]->Unmap(0, &none);
+        }
+    }
+    auto& pso = blit_psos_[Hash("laser_probe", 11, ms ? 1 : 0)];
+    if (!pso) {
+        std::string text = std::string(ms ? "#define MS 1\n" : "") + kLaserProbeHlsl;
+        uint64_t h;
+        ID3DBlob* vs = Compile(text, "vs", "vs_5_0", h);
+        ID3DBlob* ps = Compile(text, "ps", "ps_5_0", h);
+        if (!vs || !ps) return;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, DXGI_FORMAT_R32_FLOAT);
+        if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return;
+    }
+    struct Constants {
+        float vp[16];
+        float from[4];
+        float dir[4];
+        float size[4];
+    };
+    Alloc cb = Upload(sizeof(Constants), 256);
+    auto* c = reinterpret_cast<Constants*>(cb.cpu);
+    std::memcpy(c->vp, f.model_vp, sizeof(c->vp));
+    std::memcpy(c->from, f.laser, 16);
+    std::memcpy(c->dir, f.laser + 4, 16);
+    c->size[0] = float(ds.w);
+    c->size[1] = float(ds.h);
+    uint32_t slot = AllocSrvSlots(4);
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    sv.ViewDimension = ms ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (!ms) sv.Texture2D.MipLevels = 1;
+    dev_->CreateShaderResourceView(ds.res.Get(), &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
+    D3D12_SHADER_RESOURCE_VIEW_DESC none_sv{};
+    none_sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    none_sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    none_sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    for (uint32_t i = 1; i < 4; i++) dev_->CreateShaderResourceView(nullptr, &none_sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+    D3D12_RESOURCE_STATES rt_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    Transition(laser_rt_.Get(), rt_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = laser_rtv_->GetCPUDescriptorHandleForHeapStart();
+    cl_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    SetFullViewport(1, 1);
+    cl_->SetGraphicsRootSignature(root_.Get());
+    DrawFullScreen(pso.Get(), cb.gpu, slot);
+    Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    Transition(laser_rt_.Get(), rt_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION src{laser_rt_.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    src.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst{laser_rb_[laser_n_ % 4].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, 1, 1, 1, 256};
+    cl_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    laser_n_++;
+    bound_rt_ = bound_ds_ = nullptr;
+}
+
+void D3D12Backend::VrDrawModels(const State& s) {
+    const vr::Frame& f = VrFrame();
+    if (!vr::Active() || f.body.count == 0 || !EnsureVrModels()) return;
+    if (BindTargets(s) && bound_ds_) VrLaserProbe(f);
+    if (!BindTargets(s) || !bound_rt_) return;
+    Target& rt = *bound_rt_;
+    static const float bright = std::getenv("BLACK_VR_BRIGHT") ? float(std::atof(std::getenv("BLACK_VR_BRIGHT"))) : 0.6f;
+    DrawModelList(f, rt.fmt, Ms(rt), bound_ds_ != nullptr, rt.w, rt.h, bright);  // the game's scenes are dark
+    // the game's draws go on with their own root signature and pipeline
+    cl_->SetGraphicsRootSignature(root_.Get());
+}
+
+void D3D12Backend::DrawModelList(const vr::Frame& f, DXGI_FORMAT fmt, uint32_t samples, bool depth, uint32_t w,
+                                 uint32_t h, float bright) {
+    ID3D12PipelineState* pso = EnsureVrModelPipeline(fmt, samples, depth);
+    if (!pso) return;
+    const auto& models = vr::Models();
+    cl_->SetGraphicsRootSignature(vr_model_root_.Get());
+    cl_->SetPipelineState(pso);
+    SetFullViewport(w, h);
+    D3D12_VERTEX_BUFFER_VIEW vb{vr_model_vb_->GetGPUVirtualAddress(), UINT(vr_model_vb_->GetDesc().Width),
+                                sizeof(vr::ModelVertex)};
+    D3D12_INDEX_BUFFER_VIEW ib{vr_model_ib_->GetGPUVirtualAddress(), UINT(vr_model_ib_->GetDesc().Width),
+                               DXGI_FORMAT_R32_UINT};
+    cl_->IASetVertexBuffers(0, 1, &vb);
+    cl_->IASetIndexBuffer(&ib);
+    cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    struct Constants {
+        float vp[16];
+        float world[16];
+        float info[4];
+        float eye[4];
+        float bones[vr::kMaxBones * 12];
+    };
+    for (uint32_t i = 0; i < f.body.count; i++) {
+        const vr::ModelDraw& d = f.body.draws[i];
+        if (d.model < 0 || size_t(d.model) >= models.size()) continue;
+        const vr::Model& m = models[size_t(d.model)];
+        Alloc cb = Upload(sizeof(Constants), 256);
+        auto* c = reinterpret_cast<Constants*>(cb.cpu);
+        std::memcpy(c->vp, f.model_vp, sizeof(c->vp));
+        std::memcpy(c->world, d.world, sizeof(c->world));
+        c->info[0] = d.skinned ? 1.0f : 0.0f;
+        c->info[1] = bright;
+        c->info[2] = d.glow;
+        c->info[3] = m.texture.empty() ? 0.0f : 1.0f;
+        std::memcpy(c->eye, f.rows[2], sizeof(c->eye));
+        uint32_t slot = AllocSrvSlots(1);
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = UINT(-1);
+        dev_->CreateShaderResourceView(vr_model_tex_[size_t(d.model)].res.Get(), &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
+        cl_->SetGraphicsRootDescriptorTable(1, Gpu(srv_heap_.Get(), slot, srv_inc_));
+        if (d.skinned) std::memcpy(c->bones, f.body.bones, sizeof(c->bones));
+        cl_->SetGraphicsRootConstantBufferView(0, cb.gpu);
+        auto [base_v, base_i] = vr_model_base_[size_t(d.model)];
+        for (size_t p = 0; p < m.parts.size() && p < 32; p++) {
+            if (!(d.parts >> p & 1) || !m.parts[p].count) continue;
+            cl_->DrawIndexedInstanced(m.parts[p].count, 1, base_i + m.parts[p].first, INT(base_v), 0);
+        }
+    }
+}
+
+bool D3D12Backend::RecordRoom(D3D12_CPU_DESCRIPTOR_HANDLE rtv, DXGI_FORMAT fmt, uint32_t w, uint32_t h) {
+    const vr::Frame& f = VrFrame();
+    if (!EnsureVrModels()) return false;
+    if (!room_ds_ || room_w_ != w || room_h_ != h) {
+        if (room_ds_) Release(std::move(room_ds_));
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_D24_UNORM_S8_UINT, w, h);
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_CLEAR_VALUE cv{DXGI_FORMAT_D24_UNORM_S8_UINT};
+        cv.DepthStencil.Depth = 1;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
+                                                 IID_PPV_ARGS(&room_ds_))))
+            return false;
+        if (!room_dsv_) {
+            D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1};
+            dev_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&room_dsv_));
+        }
+        dev_->CreateDepthStencilView(room_ds_.Get(), nullptr, room_dsv_->GetCPUDescriptorHandleForHeapStart());
+        room_w_ = w;
+        room_h_ = h;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv = room_dsv_->GetCPUDescriptorHandleForHeapStart();
+    cl_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    const float sky[4] = {0.42f, 0.42f, 0.44f, 1};
+    cl_->ClearRenderTargetView(rtv, sky, 0, nullptr);
+    cl_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1, 0, 0, nullptr);
+    DrawModelList(f, fmt, 1, true, w, h, 1.0f);
+    bound_rt_ = bound_ds_ = nullptr;
+    return true;
+}
+
+// the frame as shown on the desktop, stretched over the headset's image for view (an eye, or the screen)
+bool D3D12Backend::RecordVr(Target* t, int view) {
+    if (!t || !shown_ || !vr_rtv_) return false;
+    vr::Image img = vr::Acquire(view);
+    if (!img.res) return false;
+    DXGI_FORMAT f = img.res->GetDesc().Format;
+    bool bgra = f == DXGI_FORMAT_B8G8R8A8_TYPELESS || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                f == DXGI_FORMAT_B8G8R8A8_UNORM;
+    DXGI_FORMAT rtv = bgra ? kBgra : DXGI_FORMAT_R8G8B8A8_UNORM;
+    D3D12_RENDER_TARGET_VIEW_DESC rd{};
+    rd.Format = rtv;
+    rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    D3D12_CPU_DESCRIPTOR_HANDLE rh = vr_rtv_->GetCPUDescriptorHandleForHeapStart();
+    dev_->CreateRenderTargetView(img.res, &rd, rh);
+    // the UI drew with its own heaps and root signature
+    Begin();
+    if (vr::RoomActive() && view < 2) return RecordRoom(rh, rtv, img.w, img.h);
+    SetBlitTarget(rh, img.w, img.h);
+    float uv[4] = {0, 0, 1, 1};
+    uint32_t mode = std::min(game::Opt().colour_blind, 3u);
+    std::array<float, 9> colour = mode ? ColourBlindMatrix(mode) : std::array<float, 9>{};
+    Blit(shown_, t->fmt, uv, {.gamma = gamma_, .rtv = rtv, .colour = mode ? colour.data() : nullptr});
+    return true;
+}
+
 void D3D12Backend::ApplySettings() {
     if (texturedumper::Update()) ReleasePackTextures();
     float want = app::RenderScale(guest_h_);
+    // VR: the headset's own pixels across the eye
+    if (uint32_t eye = vr::EyeHeight(); eye && guest_h_) want = float(eye) / float(guest_h_);
     bool remake = ext_ && ext_->Settings();
     uint32_t msaa = game::Opt().msaa;
     if (std::fabs(want - scale_) > 1e-4f || remake || msaa != msaa_set_) {

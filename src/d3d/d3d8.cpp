@@ -8,6 +8,7 @@
 #include <unordered_set>
 
 #include "app/app.h"
+#include "common/aspect.h"
 #include "common/menu.h"
 #include "common/options.h"
 #include "core/diag.h"
@@ -16,6 +17,7 @@
 #include "gpu/backend.h"
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
+#include "vr/vr.h"
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
@@ -254,6 +256,7 @@ float ZScale(const gpu::Surface& zs) {
 
 float g_view_scale = 1.0f;
 float g_near_depth = 0.0f;
+bool g_vr_gun = false;
 
 // c-38 and c-37 hold the viewport scale and offset, as D3D_GetViewportOffsetAndScale computes them.
 // The scale's unused w carries NearDepth's plane to the host shaders
@@ -269,7 +272,8 @@ void UpdateViewportConstants() {
                                      g_near_depth};
     float x = v.x + g_state.ss_offset_x + hw;
     float y = v.y + g_state.ss_offset_y + hh;
-    g_state.vsc[kViewportOffset] = {x, y, v.min_z * g_state.zscale, 0};
+    // the offset's unused w carries VrGun's flag to the renderer, in order with the draws
+    g_state.vsc[kViewportOffset] = {x, y, v.min_z * g_state.zscale, g_vr_gun ? 1.0f : 0.0f};
 }
 
 void SetComplex(uint32_t rs, uint32_t v) {
@@ -303,6 +307,18 @@ void ViewScale(float xy) {
 void NearDepth(float plane) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_near_depth = plane;
+    UpdateViewportConstants();
+}
+
+void VrModels() {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (g_backend && vr::Active()) g_backend->Clear(g_state, 0, nullptr, gpu::kClearVrModels, 0, 0, 0);
+}
+
+// VR: the draws until it is cleared are the gun and arms, which go into the hand
+void VrGun(bool on) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    g_vr_gun = on;
     UpdateViewportConstants();
 }
 
@@ -660,9 +676,13 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         g_backend_presents++;
     }
     g_fog = {};
-    app::Pace();
+    // in VR the headset paces the frames
+    if (!vr::Paced()) app::Pace();
     RotateBuffers();
     g_state.rt = SurfaceOf(Dev(kDevRenderTarget));
+    // the next frame's eye: the camera's projection, written by the camera begin update 0x2B830
+    constexpr uint32_t kProjection = 0x297720;
+    vr::GameFrame(g_backend_presents, &G<float>(kProjection), game::Aspect());
     uint32_t n = Dev(kDevSwapCount) + 1;
     SetDev(kDevSwapCount, n);
     return n;

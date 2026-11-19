@@ -2,6 +2,7 @@
 // depth buffer, and leaves, glass, particles, shadows, decals, the bloom and the HUD land on top.
 #include "common/options.h"
 #include "d3d/occlusion.h"
+#include "vr/vr.h"
 #include "xdk/hle.h"
 
 using namespace kernel;
@@ -14,6 +15,9 @@ constexpr uint32_t kProjection = 0x297720;  // camera to screen, written only by
 
 // before the frame's call that sorts and draws list 2, the alpha blended meshes
 void AmbientOcclusion(X86Context&, uint8_t*) {
+    // VR: the play camera's projection, as the world is drawn with it
+    vr::SceneDrawn(&G<float>(kProjection));
+    d3d::VrModels();
     uint32_t mode = game::Opt().ambient_occlusion;
     if (mode) d3d::Occlusion(&G<float>(kProjection), mode == 2);
 }

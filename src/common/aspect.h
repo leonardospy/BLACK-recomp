@@ -3,6 +3,7 @@
 #include <atomic>
 
 #include "app/app.h"
+#include "vr/vr.h"
 
 namespace game {
 
@@ -11,6 +12,8 @@ inline std::atomic<uint32_t> g_monitor_moves{0};
 
 // the output's shape, 4:3 at the narrowest: the frame is shown that wide
 inline float Aspect() {
+    // VR: 4:3, near an eye's shape, so the game spends its pixels and its view where an eye sees
+    if (vr::Wanted()) return 4.0f / 3.0f;
     // asked per HUD point: the desktop mode lookup only runs when the resolution setting changes
     static std::atomic<uint64_t> key{~0ull};
     static std::atomic<float> aspect{16.0f / 9.0f};

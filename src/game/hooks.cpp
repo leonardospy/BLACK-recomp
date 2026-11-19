@@ -2,13 +2,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <thread>
 
 #include "app/app.h"
 #include "common/mouse_keyboard.h"
 #include "common/options.h"
 #include "core/input.h"
+#include "core/log.h"
 #include "game/layout.h"
+#include "vr/vr.h"
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
@@ -19,6 +22,7 @@ using namespace layout;
 namespace d3d {
 void ViewScale(float xy);
 void NearDepth(float plane);
+void VrGun(bool on);
 }
 
 namespace {
@@ -184,8 +188,12 @@ static float g_game_fov = 0;  // the game's own in their place
 
 // The view of play, 70 over the zoom: the setting from the hip, the game's own once the aim is in.
 // ecx the weapon, xmm0 its zoom. Scripted cameras write theirs after this
+static void VrAim();
+
 void FieldOfView(X86Context& ctx, uint8_t*) {
     uint32_t data = R32(ctx.ecx + kWeaponData);
+    vr::HeldWeapon(ctx.ecx, data);
+    VrAim();
     float aim = data ? G<float>(data + kDataAimZoom) : 1;
     float zoom = ctx.xmm[0].f[0];
     float hip = aim > 1 ? std::clamp((aim - zoom) / (aim - 1), 0.0f, 1.0f) : 1.0f;
@@ -194,6 +202,12 @@ void FieldOfView(X86Context& ctx, uint8_t*) {
     float& fov = ctx.xmm[1].f[0];
     g_game_fov = fov;
     if (view != 1) fov = std::atan(std::tan(fov * kHalf) * view) / kHalf;
+    // VR: the renderer draws each eye at the headset's own fov from the game's view, which then only has to cover
+    // the eye for the culling; the gun keeps its true size
+    if (vr::Active()) {
+        fov = float(vr::GameFov());
+        g_gun = 1.0f;
+    }
     g_view_fov = fov;
 }
 
@@ -221,12 +235,16 @@ X86_EXTERN_FUNC(__imp__sub_00176F60);
 X86_FUNC(sub_00176F60) {
     bool list = ctx.esi == R32(kDisplay) + kDisplayDrawLists + kGunDrawList * kDrawListSize;
     bool scale = list && g_gun != 1;
-    bool keep_near = list && game::Opt().viewmodel_fov > kGameFov;
+    bool keep_near = list && game::Opt().viewmodel_fov > kGameFov && !vr::Active();
+    bool hand = list && vr::Active();  // VR: the gun and arms go into the hand
     if (scale) d3d::ViewScale(g_gun);
     if (keep_near) d3d::NearDepth(kNearPlane);
-    __imp__sub_00176F60(ctx, base);
+    if (hand) d3d::VrGun(true);
+    // the player's own gun and arms replace the game's (vr/body.cpp), its muzzle flash with them for now
+    if (!hand || !vr::OwnModels() || vr::HeldGun() < 0) __imp__sub_00176F60(ctx, base);
     if (scale) d3d::ViewScale(1);
     if (keep_near) d3d::NearDepth(0);
+    if (hand) d3d::VrGun(false);
 }
 
 static uint32_t Player() { return R32(kWorld) + kWorldPlayer; }
@@ -249,7 +267,98 @@ static void OnGun(uint32_t at, bool point) {
 constexpr uint32_t kMatrixPosition = 48;  // the last of a matrix's four rows
 
 // A locator's matrix moved onto the gun's picture, as a copy: the game's own stays where bullets start
+static void ViewRay(const float*& eye, const float*& forward);
+static bool ViewAxes(const float* f, float right[3], float up[3]);
+
+// VR: a point on the game's gun moved to the muzzle of the gun in the hand. The world is y up, left handed
+static bool ToHand(uint32_t at) {
+    float r, u, a;
+    if (!vr::Active() || !vr::Muzzle(r, u, a)) return false;
+    const float* f;
+    const float* eye;
+    ViewRay(eye, f);
+    float right[3], up[3];
+    if (!ViewAxes(f, right, up)) return false;
+    float* v = &G<float>(at);
+    for (int i = 0; i < 3; i++) v[i] = eye[i] + right[i] * r + up[i] * u + f[i] * a;
+    return true;
+}
+
+// VR: the player's line of fire, which the game keeps as the eye and its forward, set to the hand's: the shots
+// start at the gun and go where it points. The view is drawn from the camera's own matrices, which stay the head's
+static float g_true_forward[3], g_true_eye[3], g_set_forward[3], g_set_eye[3];
+static bool g_aim_set = false;
+
+// the view's own eye and forward: the game's, as they were before VrAim wrote over them
+static void ViewRay(const float*& eye, const float*& forward) {
+    float* f = &G<float>(Player() + kPlayerForward);
+    float* e = &G<float>(Player() + kPlayerEye);
+    bool ours = g_aim_set && !std::memcmp(f, g_set_forward, 12) && !std::memcmp(e, g_set_eye, 12);
+    if (!ours) {
+        std::memcpy(g_true_forward, f, 12);
+        std::memcpy(g_true_eye, e, 12);
+    }
+    eye = g_true_eye;
+    forward = g_true_forward;
+}
+
+// the camera's axes from its forward: the world is y up, left handed
+static bool ViewAxes(const float* f, float right[3], float up[3]) {
+    right[0] = f[2];
+    right[1] = 0;
+    right[2] = -f[0];
+    float len = std::sqrt(right[0] * right[0] + right[2] * right[2]);
+    if (len < 1e-4f) return false;
+    for (int i = 0; i < 3; i++) right[i] /= len;
+    up[0] = f[1] * right[2] - f[2] * right[1];
+    up[1] = f[2] * right[0] - f[0] * right[2];
+    up[2] = f[0] * right[1] - f[1] * right[0];
+    // the world's x lies to the view's left (the game's projection flips it): the view's right is the other way
+    for (int i = 0; i < 3; i++) right[i] = -right[i];
+    return true;
+}
+
+static void VrAim() {
+    float dir[3], from[3];
+    if (!vr::Active()) return;
+    const float* eye;
+    const float* f;
+    ViewRay(eye, f);
+    static int said = 0;
+    if (said < 3 && g_aim_set && std::memcmp(&G<float>(Player() + kPlayerForward), g_set_forward, 12)) {
+        said++;
+        LOGR("vr: the game renews the line of fire each frame");
+    }
+    float right[3], up[3];
+    if (ViewAxes(f, right, up)) vr::PlayerView(eye, right, up, f);
+    if (!vr::AimRay(dir, from) || !ViewAxes(f, right, up)) {
+        g_aim_set = false;
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        g_set_forward[i] = right[i] * dir[0] + up[i] * dir[1] + f[i] * dir[2];
+        g_set_eye[i] = eye[i] + right[i] * from[0] + up[i] * from[1] + f[i] * from[2];
+    }
+    std::memcpy(&G<float>(Player() + kPlayerForward), g_set_forward, 12);
+    std::memcpy(&G<float>(Player() + kPlayerEye), g_set_eye, 12);
+    g_aim_set = true;
+}
+
+// VR: right as a shot reads the line of fire from its owner, the hand's (the game renews it from the view each
+// frame): eax the owner where the shot takes its start, ecx where it takes the aim
+void ShotStart(X86Context& ctx, uint8_t*) {
+    if (ctx.eax == Player()) VrAim();
+}
+void ShotAim(X86Context& ctx, uint8_t*) {
+    if (ctx.ecx == Player()) VrAim();
+}
+
 static uint32_t Follow(uint32_t matrix, uint32_t owner, bool axes) {
+    if (vr::Active() && matrix != 0x5655C0 && owner == Player()) {
+        static uint32_t copy = mem::AllocSystem(64, 16);
+        std::memcpy(HostPtr(copy), HostPtr(matrix), 64);
+        return ToHand(copy + kMatrixPosition) ? copy : matrix;
+    }
     if (g_gun == 1 || matrix == 0x5655C0 || owner != Player()) return matrix;
     static uint32_t copy = mem::AllocSystem(64, 16);
     std::memcpy(HostPtr(copy), HostPtr(matrix), 64);
@@ -260,7 +369,10 @@ static uint32_t Follow(uint32_t matrix, uint32_t owner, bool axes) {
 constexpr uint32_t kEffectOwner = 0x44;
 
 // the muzzle flash sprite, drawn with the matrix
-void FlashSprite(X86Context& ctx, uint8_t*) { ctx.eax = Follow(ctx.eax, Player(), true); }
+void FlashSprite(X86Context& ctx, uint8_t*) {
+    vr::Fired();  // the hand's gun flashes with it
+    ctx.eax = Follow(ctx.eax, Player(), true);
+}
 // effects that follow a locator of their owner (edi)
 void GunEffect(X86Context& ctx, uint8_t*) { ctx.eax = Follow(ctx.eax, ctx.edi, false); }
 // effects that start at one
@@ -274,9 +386,13 @@ constexpr uint32_t kShotWeapon = 4;
 void TracerStart(X86Context& ctx, uint8_t*) {
     uint32_t shot = R32(ctx.esi + kBulletShot);
     uint32_t weapon = shot ? R32(shot + kShotWeapon) : 0;
-    if (g_gun == 1 || !weapon || R32(weapon + kWeaponOwner) != Player()) return;
+    if ((g_gun == 1 && !vr::Active()) || !weapon || R32(weapon + kWeaponOwner) != Player()) return;
     static uint32_t copy = mem::AllocSystem(16, 16);
     std::memcpy(HostPtr(copy), HostPtr(ctx.eax), 16);
+    if (vr::Active()) {
+        if (ToHand(copy)) ctx.eax = copy;
+        return;
+    }
     ctx.eax = copy;
     OnGun(copy, true);
 }
@@ -290,11 +406,19 @@ X86_FUNC(sub_001D2860) {
     uint32_t from = R32(ctx.esp);
     uint32_t out = R32(ctx.esp + 4);
     __imp__sub_001D2860(ctx, base);
-    if (g_gun != 1 && (from == kFromTracerA || from == kFromTracerB)) OnGun(out + kMatrixPosition, true);
+    bool tracer = from == kFromTracerA || from == kFromTracerB;
+    if (tracer && vr::Active()) {
+        ToHand(out + kMatrixPosition);
+        return;
+    }
+    if (g_gun != 1 && tracer) OnGun(out + kMatrixPosition, true);
 }
 
 // recoil dies away by a factor a frame
-void RecoilDecay(X86Context& ctx, uint8_t*) { ctx.xmm[0].f[0] = std::pow(ctx.xmm[0].f[0], FrameShare()); }
+void RecoilDecay(X86Context& ctx, uint8_t*) {
+    // VR: the view is the head's, no kick shakes it; the gun in the hand kicks instead
+    ctx.xmm[0].f[0] = vr::Active() ? 0.0f : std::pow(ctx.xmm[0].f[0], FrameShare());
+}
 
 constexpr uint32_t kDataSwayShares = 0x104;
 
@@ -607,7 +731,8 @@ void DrawListRoom(X86Context&, uint8_t*) {
 }
 
 // reload animations start the screen blur
-bool ReloadBlur(X86Context&, uint8_t*) { return game::Opt().reload_blur; }
+// VR: never (the blur is on the eyes, not a screen)
+bool ReloadBlur(X86Context&, uint8_t*) { return game::Opt().reload_blur && !vr::Active(); }
 
 // the blur holds for the animation's frames times the last frame's time: frames of the game's frame rate instead
 constexpr uint32_t kAnimationFrames = 0x1C;

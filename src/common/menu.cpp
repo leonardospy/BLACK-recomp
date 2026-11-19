@@ -30,6 +30,7 @@
 #include "common/mouse_keyboard.h"
 #include "common/options.h"
 #include "common/translations.h"
+#include "vr/vr.h"
 
 namespace app {
 
@@ -239,7 +240,7 @@ enum RowId { kDisplayMode, kResolution, kRenderResolution, kMaxFps, kVsync, kFps
              kGyroAiming, kGyroSensitivity, kAimAssist, kGyroAxis, kGyroButton, kGyroButtonMode, kGyroRecenter,
              kGyroCalibrate, kColourBlind, kSensitivityVertical, kAimHorizontal, kAimVertical, kInvertMouseX,
              kControllerVertical, kPadAimHorizontal, kPadAimVertical, kInvertPadX, kTextureReplacement,
-             kTextureDumping, kDumpFormat, kDeadZone };
+             kTextureDumping, kDumpFormat, kDeadZone, kVrHudSize, kVrWorldScale, kVrTestRoom, kVrLeftHanded };
 
 using rows::Kind;
 using rows::Row;
@@ -275,6 +276,11 @@ constexpr Row kSettingsRows[] = {
     {Kind::Value, kTextureReplacement, "TEXTURE REPLACEMENT"},
     {Kind::Value, kTextureDumping, "TEXTURE DUMPING"},
     {Kind::Value, kDumpFormat, "DUMP FORMAT"},
+    {Kind::Heading, -1, "VR"},
+    {Kind::Value, kVrHudSize, "VR HUD SIZE"},
+    {Kind::Value, kVrWorldScale, "VR WORLD SCALE"},
+    {Kind::Value, kVrLeftHanded, "VR LEFT HANDED"},
+    {Kind::Value, kVrTestRoom, "VR TEST ROOM"},
 };
 
 const std::vector<Row>& InputRows() {
@@ -339,6 +345,7 @@ bool* ToggleFlag(Settings& s, int id) {
         case kControllerHoldAim: return &o.controller_hold_aim;
         case kGyroAiming: return &o.gyro.enabled;
         case kAimAssist: return &o.aim_assist;
+        case kVrLeftHanded: return &o.vr_left_handed;
         default: return nullptr;
     }
 }
@@ -499,6 +506,18 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
             return true;
         case kDrawDistance:
             std::snprintf(text, sizeof(text), "%s", kDistanceNames[StepTable(kDistances, o.draw_distance, step)]);
+            return true;
+        case kVrHudSize:
+            if (step) o.vr_hud_size = uint32_t(StepRange(int(o.vr_hud_size), 20, 100, 5, step));
+            std::snprintf(text, sizeof(text), "%u%%", o.vr_hud_size);
+            return true;
+        case kVrWorldScale:
+            if (step) o.vr_world_scale = uint32_t(StepRange(int(o.vr_world_scale), 25, 400, 5, step));
+            std::snprintf(text, sizeof(text), "%u%%", o.vr_world_scale);
+            return true;
+        case kVrTestRoom:  // the grey room with the guns on its floor (vr/openxr.cpp); both stick clicks held do the same
+            if (step) vr::SetRoom(!vr::RoomActive());
+            std::snprintf(text, sizeof(text), "%s", vr::RoomActive() ? "ON" : "OFF");
             return true;
         default:
             return false;

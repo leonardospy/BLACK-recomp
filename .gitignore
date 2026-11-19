@@ -26,3 +26,13 @@ black.toml
 
 # Local temporary folder
 .local
+
+# downloaded game image
+/Jogo/
+
+# VR model previews (tools/vr_preview.py)
+/vr_assets/preview/
+
+# VR guns made from the game files (tools/game_guns.py)
+/vr_assets/g_*.bvr
+/vr_assets/glb/

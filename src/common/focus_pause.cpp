@@ -11,6 +11,7 @@
 #include "audio/output.h"
 #include "common/options.h"
 #include "core/log.h"
+#include "vr/vr.h"
 
 namespace game {
 
@@ -28,7 +29,8 @@ bool Unfocused() {
 }  // namespace
 
 void WaitWhileUnfocused() {
-    if (!Opt().pause_on_focus_loss || !Unfocused()) return;
+    // in VR the headset, not the desktop window, has the player's attention
+    if (vr::Wanted() || !Opt().pause_on_focus_loss || !Unfocused()) return;
     LOGI("focus lost: paused");
     g_focus_paused = true;
     audio::SetPaused(true);

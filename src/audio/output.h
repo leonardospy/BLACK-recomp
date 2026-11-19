@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace audio {
 
@@ -34,5 +35,7 @@ constexpr uint32_t kOutputMono = 3;
 void SetOutputMode(uint32_t mode);
 // any thread: paused, the output stops and the mixer is not run, so every voice and stream keeps its place
 void SetPaused(bool paused);
+// any thread: plays on the device with this endpoint id from now on (the VR headset's), empty for the default
+void SetDevice(const std::wstring& id);
 
 }  // namespace audio

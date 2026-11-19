@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <future>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -151,13 +152,34 @@ void ApplyMatrix(Output& out) {
     LOGI("audio: %s output, %u device channels, speakers %lX", OutputName(), outputs, mask);
 }
 
+std::mutex g_device_lock;
+std::wstring g_device;                    // the endpoint to play on, empty the default
+std::atomic<bool> g_device_changed{false};
+
+// the master on the wanted device (the default when it cannot be opened) and the source voice into it
+bool OpenVoices(Output& out) {
+    std::wstring id;
+    {
+        std::lock_guard lock(g_device_lock);
+        id = g_device;
+    }
+    HRESULT hr = E_FAIL;
+    if (!id.empty()) {
+        hr = out.xa->CreateMasteringVoice(&out.master, XAUDIO2_DEFAULT_CHANNELS, XAUDIO2_DEFAULT_SAMPLERATE, 0, id.c_str());
+        if (FAILED(hr)) LOGE("audio: the device %ls could not be opened (%08lX), the default plays", id.c_str(), hr);
+        else LOGI("audio: playing on %ls", id.c_str());
+    }
+    if (FAILED(hr) && FAILED(out.xa->CreateMasteringVoice(&out.master))) return false;
+    WAVEFORMATEXTENSIBLE wf = MixFormat();
+    if (FAILED(out.xa->CreateSourceVoice(&out.voice, &wf.Format))) return false;
+    ApplyMatrix(out);
+    return true;
+}
+
 std::optional<Output> Open() {
     Output out;
     if (FAILED(XAudio2Create(&out.xa, 0, XAUDIO2_DEFAULT_PROCESSOR))) return std::nullopt;
-    if (FAILED(out.xa->CreateMasteringVoice(&out.master))) return std::nullopt;
-    WAVEFORMATEXTENSIBLE wf = MixFormat();
-    if (FAILED(out.xa->CreateSourceVoice(&out.voice, &wf.Format))) return std::nullopt;
-    ApplyMatrix(out);
+    if (!OpenVoices(out)) return std::nullopt;
     return out;
 }
 
@@ -173,6 +195,18 @@ void Pump(Output& out, const std::function<void(float*, uint32_t)>& render) {
     bool stopped = false;
     for (uint32_t n = 0;;) {
         if (g_mode_changed.exchange(false)) ApplyMatrix(out);
+        if (g_device_changed.exchange(false)) {
+            // another device: the voices again on it, playing on where they left
+            out.voice->DestroyVoice();
+            out.master->DestroyVoice();
+            out.voice = nullptr;
+            out.master = nullptr;
+            if (!OpenVoices(out)) {
+                LOGE("audio: no output device, no sound");
+                return;
+            }
+            if (!stopped) out.voice->Start();
+        }
         if (g_paused != stopped) {
             stopped = !stopped;
             if (stopped) out.voice->Stop();
@@ -214,6 +248,15 @@ void SetOutputMode(uint32_t mode) {
 }
 
 void SetPaused(bool paused) { g_paused = paused; }
+
+void SetDevice(const std::wstring& id) {
+    {
+        std::lock_guard lock(g_device_lock);
+        if (g_device == id) return;
+        g_device = id;
+    }
+    g_device_changed = true;
+}
 
 void StartOutput(std::function<void(float*, uint32_t)> render) {
     std::promise<void> opened;

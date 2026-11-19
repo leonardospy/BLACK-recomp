@@ -52,6 +52,9 @@ struct Options {
     gyro::Settings gyro;  // the controller's gyro turns the view, beside the right stick
     bool menu_animations = true;  // off: menu pages and the pause menu change without sliding in and out
     std::map<std::string, std::string> keys;  // action id to key names, absent is the default
+    uint32_t vr_hud_size = 60;  // percent of an eye's width the HUD spans
+    uint32_t vr_world_scale = 100;  // percent: game units per metre of head movement and between the eyes
+    bool vr_left_handed = false;    // the gun in the left hand, the pouch on the right hip, the controllers swapped
 };
 Options& Opt();
 // one of kLanguages for a language setting: "auto" is the Windows display language, English when the game lacks it
